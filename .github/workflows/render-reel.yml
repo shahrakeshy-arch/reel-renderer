@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   render:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       JOB_ID: ${{ inputs.job_id }}
@@ -42,13 +42,15 @@ jobs:
       - name: Install FFmpeg and Edge TTS
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
-          pip install -q edge-tts
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core espeak-ng
+          pip install -q --upgrade edge-tts
 
       - name: Render video
         env:
           PAYLOAD: ${{ inputs.payload }}
-        run: python render.py
+        run: |
+          set -o pipefail
+          python render.py 2>&1 | tee render.log
 
       - name: Publish to GitHub Pages (gh-pages branch)
         env:
@@ -100,5 +102,12 @@ jobs:
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          curl -sS -X POST "$CALLBACK_URL" -H 'Content-Type: application/json' \
-            -d "{\"status\":\"error\",\"message\":\"GitHub render failed. Logs: ${RUN_URL}\",\"job_id\":\"${JOB_ID}\"}"
+          python3 - <<'PY' > fail.json
+          import json, os
+          tail = ""
+          if os.path.exists("render.log"):
+              tail = " | ".join(open("render.log", errors="ignore").read().strip().splitlines()[-6:])[-900:]
+          print(json.dumps({"status": "error", "job_id": os.environ["JOB_ID"],
+                            "message": "GitHub render failed: " + (tail or "see logs") + " Logs: " + os.environ["RUN_URL"]}))
+          PY
+          curl -sS -X POST "$CALLBACK_URL" -H 'Content-Type: application/json' --data @fail.json
