@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import subprocess
+import time
 import urllib.request
 
 import edge_tts
@@ -52,6 +53,50 @@ async def tts(text, path):
     return words
 
 
+def download(url, path):
+    last = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Referer": "https://pixabay.com/"})
+            with urllib.request.urlopen(req, timeout=120) as r, open(path, "wb") as f:
+                f.write(r.read())
+            return
+        except Exception as e:
+            last = e
+            print(f"clip download failed (try {attempt + 1}): {e}", flush=True)
+            time.sleep(3 * (attempt + 1))
+    # last resort: curl
+    try:
+        run(["curl", "-fsSL", "--retry", "3", "-A", "Mozilla/5.0", "-o", path, url])
+        return
+    except Exception:
+        pass
+    raise RuntimeError(f"Could not download stock clip {url}: {last}")
+
+
+def voiceover(text, i, wav):
+    """Edge TTS (natural voice) with retries; falls back to offline espeak-ng so the Reel still renders."""
+    mp3 = f"work/voice_{i}.mp3"
+    for attempt in range(3):
+        try:
+            words = asyncio.run(tts(text, mp3))
+            if os.path.getsize(mp3) > 1000:
+                run(["ffmpeg", "-y", "-loglevel", "error", "-i", mp3, "-ar", "48000", "-ac", "2", wav])
+                return words
+            raise RuntimeError("empty audio")
+        except Exception as e:
+            print(f"Edge TTS failed (try {attempt + 1}): {e}", flush=True)
+            time.sleep(4 * (attempt + 1))
+    print("WARNING: using offline espeak-ng voice fallback", flush=True)
+    raw = f"work/voice_{i}_raw.wav"
+    run(["espeak-ng", "-v", "en-us", "-s", "165", "-w", raw, text])
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw, "-ar", "48000", "-ac", "2", wav])
+    return []
+
+
 def even_words(text, total):
     # Fallback when the voice gives no word timings: spread words by length.
     parts = text.split()
@@ -81,14 +126,10 @@ video_list, audio_list = [], []
 
 for i, sc in enumerate(scenes):
     clip = f"work/clip_{i}.mp4"
-    req = urllib.request.Request(sc["clip"], headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as r, open(clip, "wb") as f:
-        f.write(r.read())
+    download(sc["clip"], clip)
 
-    mp3 = f"work/voice_{i}.mp3"
-    words = asyncio.run(tts(sc["text"], mp3))
     wav = f"work/voice_{i}.wav"
-    run(["ffmpeg", "-y", "-loglevel", "error", "-i", mp3, "-ar", "48000", "-ac", "2", wav])
+    words = voiceover(sc["text"], i, wav)
     dur = duration(wav)
     if not words:
         words = even_words(sc["text"], dur)
