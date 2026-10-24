@@ -1,0 +1,104 @@
+name: Render Reel
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Job id from n8n
+        required: true
+      payload:
+        description: Reel JSON (headline, voice, scenes)
+        required: true
+      callback_url:
+        description: n8n resume URL
+        required: true
+
+permissions:
+  contents: write
+  pages: read
+
+concurrency:
+  group: render-reel
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      CALLBACK_URL: ${{ inputs.callback_url }}
+      KEEP_REELS: 8
+    steps:
+      - name: Hide callback URL in logs
+        run: echo "::add-mask::$CALLBACK_URL"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg and Edge TTS
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          pip install -q edge-tts
+
+      - name: Render video
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: python render.py
+
+      - name: Publish to GitHub Pages (gh-pages branch)
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git config --global user.name "reel-bot"
+          git config --global user.email "reel-bot@users.noreply.github.com"
+          REPO_URL="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if ! git clone -q --depth 1 --branch gh-pages "$REPO_URL" site; then
+            mkdir site && git -C site init -q && git -C site remote add origin "$REPO_URL"
+          fi
+          mkdir -p site/reels
+          cp "out/${JOB_ID}.mp4" site/reels/
+          # keep only the newest reels so the repo stays small
+          ls site/reels/*.mp4 | sort | head -n -"$KEEP_REELS" | xargs -r rm -f
+          touch site/.nojekyll
+          cd site
+          git checkout -q --orphan publish
+          git add -A
+          git commit -q -m "Reel ${JOB_ID}"
+          git push -q -f origin publish:gh-pages
+
+      - name: Wait until the video is live
+        id: live
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE=$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq .html_url)
+          URL="${BASE%/}/reels/${JOB_ID}.mp4"
+          code=000
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -I "${URL}?cb=${i}")
+            [ "$code" = "200" ] && break
+            sleep 15
+          done
+          [ "$code" = "200" ] || { echo "Video never went live at $URL"; exit 1; }
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Tell n8n the Reel is ready
+        if: success()
+        env:
+          VIDEO_URL: ${{ steps.live.outputs.url }}
+        run: |
+          curl -sS -X POST "$CALLBACK_URL" -H 'Content-Type: application/json' \
+            -d "{\"status\":\"success\",\"video_url\":\"${VIDEO_URL}\",\"job_id\":\"${JOB_ID}\"}"
+
+      - name: Tell n8n the render failed
+        if: failure()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -sS -X POST "$CALLBACK_URL" -H 'Content-Type: application/json' \
+            -d "{\"status\":\"error\",\"message\":\"GitHub render failed. Logs: ${RUN_URL}\",\"job_id\":\"${JOB_ID}\"}"
